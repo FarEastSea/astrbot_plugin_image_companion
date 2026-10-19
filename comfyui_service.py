@@ -44,7 +44,7 @@ class ComfyUIService:
             headers = {}
             if self.config.get("api_key"):
                 headers["Authorization"] = "Bearer " + str(self.config["api_key"])
-            self._session = aiohttp.ClientSession(headers=headers, timeout=aiohttp.ClientTimeout(total=30), trust_env=False)
+            self._session = aiohttp.ClientSession(headers=headers, timeout=aiohttp.ClientTimeout(total=30, connect=10), trust_env=False)
         return self._session
 
     async def _request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
@@ -54,7 +54,7 @@ class ComfyUIService:
             async for chunk in response.content.iter_chunked(65536):
                 raw.extend(chunk)
                 if len(raw) > 8 * 1024 * 1024:
-                    raise WorkflowError("ComfyUI 返回内容过大")
+                    raise WorkflowError("ComfyUI 返回内容过大", submitted=path == "/prompt", failure_stage="submission")
             try:
                 value = json.loads(raw) if raw else {}
             except ValueError as exc:
@@ -150,12 +150,33 @@ class ComfyUIService:
 
     async def submit_generation(self, workflow_id: str, slots: Mapping[str, Any], *, mapping: Mapping[str, Any] | None = None) -> dict[str, Any]:
         workflow, report = self.prepare_generation(workflow_id, slots, mapping=mapping)
-        response = await self._request("POST", "/prompt", json={"client_id": self.client_id, "prompt": workflow})
-        task_id = str(response.get("prompt_id") or "")
-        if not task_id:
-            raise WorkflowError("ComfyUI 未返回任务编号")
+        task_id = await self._submit_prompt(workflow)
         self._tasks[task_id] = report["output_node"]
         return {"task_id": task_id, **report}
+
+    async def _submit_prompt(self, workflow: Mapping[str, Any]) -> str:
+        import aiohttp
+
+        try:
+            response = await self._request("POST", "/prompt", json={"client_id": self.client_id, "prompt": workflow})
+        except (aiohttp.ClientConnectorError, aiohttp.ConnectionTimeoutError) as exc:
+            # Connector failures happen before a request can reach ComfyUI.
+            # Read timeouts and disconnects do not give that guarantee.
+            raise WorkflowError(
+                f"ComfyUI 未能建立连接，任务未提交（{type(exc).__name__}）",
+                submitted=False, failure_stage="connection",
+            ) from exc
+        except (WorkflowError, asyncio.CancelledError):
+            raise
+        except Exception as exc:
+            raise WorkflowError(
+                f"ComfyUI 提交结果不明，已停止自动回退以避免重复生成（{type(exc).__name__}）",
+                submitted=True, failure_stage="submission",
+            ) from exc
+        task_id = str(response.get("prompt_id") or "")
+        if not task_id:
+            raise WorkflowError("ComfyUI 未返回任务编号", submitted=True, failure_stage="submission")
+        return task_id
 
     async def get_status(self, task_id: str) -> dict[str, Any]:
         queue = await self._request("GET", "/queue")
@@ -330,16 +351,7 @@ class ComfyUIService:
                     raise WorkflowError("参考图上传没有返回文件名")
         # Submit the captured graph, not a second read after model analysis.
         prepared = fill_workflow(workflow, mapping, slots)
-        try:
-            submitted = await self._request("POST", "/prompt", json={"client_id": self.client_id, "prompt": prepared})
-        except (WorkflowError, asyncio.CancelledError):
-            raise
-        except Exception as exc:
-            # A lost response cannot prove that ComfyUI did not accept the job.
-            raise WorkflowError("ComfyUI 提交结果不明，已停止自动回退以避免重复生成", submitted=True, failure_stage="submission") from exc
-        task_id = str(submitted.get("prompt_id") or "")
-        if not task_id:
-            raise WorkflowError("ComfyUI 未返回任务编号", submitted=True, failure_stage="submission")
+        task_id = await self._submit_prompt(prepared)
         self._tasks[task_id] = mapping["output_node"]
         cleanup_attempted = False
         try:
